@@ -1,17 +1,13 @@
 import astropy.units as u
 import gala.dynamics as gd
+import gala.potential as gp
 import matplotlib.pyplot as plt
 import numpy as np
-from astropy.coordinates import (
-    CartesianDifferential,
-    CartesianRepresentation,
-    Galactocentric,
-    SkyCoord,
-)
+from astropy.coordinates import Galactocentric, SkyCoord
 from astropy.io import fits
 from astropy.table import Table
-from gala.action_angle import actionAngleStaeckel  # New import for computing actions
-from gala.potential import MilkyWayPotential
+from gala.dynamics.actionangle import get_staeckel_fudge_delta
+from galpy.actionAngle import actionAngleStaeckel
 
 # -------------------------------
 # 1. Load the DESI VAC and merge extensions
@@ -29,7 +25,6 @@ gaia = Table.read(filename, hdu="GAIA")
 combined = rvt.copy()
 for col in gaia.colnames + spt.colnames:
     if col not in combined.colnames:
-        # Use the column from gaia if it exists; otherwise from spt
         combined[col] = gaia[col] if col in gaia.colnames else spt[col]
 
 # -------------------------------
@@ -48,36 +43,55 @@ sel_clean = (
 selected_stars = combined[sel_clean]
 
 # -------------------------------
-# 3. Compute distances and filter
+# 3. Compute distances and apply heliocentric distance cut (< 5 kpc)
 # -------------------------------
-# Convert parallax (in mas) to arcsec then compute distance in kpc.
 parallax_arcsec = selected_stars["PARALLAX"].astype(float) * 1e-3
 valid_parallax = parallax_arcsec > 0
 selected_stars = selected_stars[valid_parallax]
-# Distance in kpc: 1/parallax (arcsec) gives distance in parsecs, so divide by 1000.
 dist_kpc = 1.0 / (parallax_arcsec[valid_parallax] * 1000.0)
 selected_stars["DIST_KPC"] = dist_kpc
+
+selected_stars = selected_stars[selected_stars["DIST_KPC"] <= 5]
+
+print("\nCatalog mean values (full sample after distance cut):")
+print("Mean Distance [kpc]:", np.mean(selected_stars["DIST_KPC"]))
+print("Mean VRAD [km/s]:", np.mean(selected_stars["VRAD"]))
+print("Mean PMRA [mas/yr]:", np.mean(selected_stars["PMRA"]))
+print("Mean PMDEC [mas/yr]:", np.mean(selected_stars["PMDEC"]))
+
+mask_pm = (np.abs(selected_stars["PMRA"]) < 200) & (
+    np.abs(selected_stars["PMDEC"]) < 200
+)
+selected_stars = selected_stars[mask_pm]
+print("\nAfter applying proper-motion cut (|PMRA|<200, |PMDEC|<200):")
+print("Mean PMRA [mas/yr]:", np.mean(selected_stars["PMRA"]))
+print("Mean PMDEC [mas/yr]:", np.mean(selected_stars["PMDEC"]))
+
+N_sample = len(selected_stars)
+if len(selected_stars) > N_sample:
+    np.random.seed(42)
+    indices = np.random.choice(
+        np.arange(len(selected_stars)), size=N_sample, replace=False
+    )
+    selected_stars = selected_stars[indices]
+print(
+    "\nNumber of stars after distance & PM cuts and random sampling:",
+    len(selected_stars),
+)
+
+total_pm = np.sqrt(selected_stars["PMRA"] ** 2 + selected_stars["PMDEC"] ** 2)
+total_vel = np.sqrt(total_pm**2 + selected_stars["VRAD"] ** 2)
+print("\nRandom sample velocity statistics (mean values):")
+print(f"Mean Radial velocity: {np.mean(selected_stars['VRAD']):.1f} km/s")
+print(f"Mean Proper motion RA: {np.mean(selected_stars['PMRA']):.1f} mas/yr")
+print(f"Mean Proper motion Dec: {np.mean(selected_stars['PMDEC']):.1f} mas/yr")
+
+print("\nUsing all {} stars for orbit integration.".format(len(selected_stars)))
 
 # -------------------------------
 # 4. Build a SkyCoord object
 # -------------------------------
-mask_finite = (
-    np.isfinite(selected_stars["TARGET_RA"])
-    & np.isfinite(selected_stars["TARGET_DEC"])
-    & np.isfinite(selected_stars["PMRA"])
-    & np.isfinite(selected_stars["PMDEC"])
-    & np.isfinite(selected_stars["DIST_KPC"])
-    & np.isfinite(selected_stars["VRAD"])
-)
-selected_stars = selected_stars[mask_finite]
-selected_stars = selected_stars[selected_stars["DIST_KPC"] <= 100]
-
-# --- Decouple the radial_velocity unit if it already exists ---
-if hasattr(selected_stars["VRAD"], "quantity"):
-    vrad_val = selected_stars["VRAD"].quantity.value.astype(float)
-else:
-    vrad_val = selected_stars["VRAD"].data.astype(float)
-
+vrad_val = selected_stars["VRAD"].data.astype(float)
 coords = SkyCoord(
     ra=selected_stars["TARGET_RA"] * u.deg,
     dec=selected_stars["TARGET_DEC"] * u.deg,
@@ -87,7 +101,13 @@ coords = SkyCoord(
     radial_velocity=vrad_val * u.km / u.s,
     frame="icrs",
 )
+print("\nSkyCoord object created:")
+print("Number of stars:", len(coords))
+print("Sample coordinate (star 0):", coords[0])
 
+# -------------------------------
+# 5. Transform to a Galactocentric frame and compute orbital circularity
+# -------------------------------
 galcen_frame = Galactocentric(
     galcen_distance=8.178 * u.kpc,
     z_sun=20.8 * u.pc,
@@ -95,6 +115,8 @@ galcen_frame = Galactocentric(
     galcen_v_sun=[11.1, 250.24, 7.25] * u.km / u.s,
 )
 galcen = coords.transform_to(galcen_frame)
+print("\nTransformed to Galactocentric frame.")
+print("Sample Galactocentric coordinate (star 0):", galcen[0])
 
 X = galcen.x.to(u.kpc).value
 Y = galcen.y.to(u.kpc).value
@@ -103,105 +125,122 @@ vX = galcen.v_x.to(u.km / u.s).value
 vY = galcen.v_y.to(u.km / u.s).value
 vZ = galcen.v_z.to(u.km / u.s).value
 
+print("\nSample positions (kpc):")
+print("X[0] =", X[0], "Y[0] =", Y[0], "Z[0] =", Z[0])
+print("Sample velocities (km/s):")
+print("vX[0] =", vX[0], "vY[0] =", vY[0], "vZ[0] =", vZ[0])
+
 R = np.sqrt(X**2 + Y**2)
 phi = np.arctan2(Y, X)
-vR = (X * vX + Y * vY) / R
 vT = (-Y * vX + X * vY) / R
+v_phi = -vT  # so that prograde orbits have v_phi > 0.
+Lz = R * v_phi
 
-# -------------------------------
-# 6. Compute Orbital Properties using gala
-# -------------------------------
-mw_pot = MilkyWayPotential()
+potential = gp.MilkyWayPotential()
+pos_for_vcirc = np.vstack([R, np.zeros_like(R), np.zeros_like(R)]) * u.kpc
+v_circ = potential.circular_velocity(pos_for_vcirc).to(u.km / u.s).value
+Lz_circ = R * v_circ
+epsilon = Lz / Lz_circ
 
-# Create a PhaseSpacePosition object
-pos = CartesianRepresentation(x=X * u.kpc, y=Y * u.kpc, z=Z * u.kpc)
-vel = CartesianDifferential(
-    d_x=vX * u.km / u.s, d_y=vY * u.km / u.s, d_z=vZ * u.km / u.s
-)
-pos = pos.with_differentials(vel)
-w0 = gd.PhaseSpacePosition(pos)
+print("\nCylindrical coordinate mean values:")
+print("Mean R [kpc]:", np.mean(R))
+print("Mean v_phi [km/s]:", np.mean(v_phi))
+print("Mean epsilon (circularity):", np.mean(epsilon))
+print("Note: For halo stars we expect epsilon <= 0.75.")
 
-# Compute actions using the actionAngleStaeckel method.
-aAS = actionAngleStaeckel(pot=mw_pot, delta=0.45 * u.kpc)
-actions = aAS(w0)
-Jr = actions["Jr"].value
-# Note: actionAngleStaeckel returns 'Lz' instead of 'Jphi'; they are equivalent.
-Jphi = actions["Lz"].value
-Jz = actions["Jz"].value
+mask_halo = epsilon <= 0.75
+print("Stars before halo cut:", len(R), "after halo cut:", np.sum(mask_halo))
+print("First 10 epsilon values:", epsilon[:10])
 
-# Compute energy directly from the potential
-E = mw_pot.energy(w0).value
-
-# -------------------------------
-# 7. Apply Halo Selection
-# -------------------------------
-V_c = mw_pot.circular_velocity(R * u.kpc).to(u.km / u.s).value
-epsilon = Jphi / (R * V_c)
-halo_mask = (np.abs(epsilon) <= 0.75) & (Jr < 1e4)
-halo_stars = selected_stars[halo_mask]
-print("Number of halo stars:", len(halo_stars))
-
-R_halo = R[halo_mask]
-vR_halo = vR[halo_mask]
-vT_halo = vT[halo_mask]
-epsilon_halo = epsilon[halo_mask]
-Jphi_halo = Jphi[halo_mask]
-E_halo = E[halo_mask]
-Jr_halo = Jr[halo_mask]
-
-# -------------------------------
-# 8. Visualization of Orbital Properties
-# -------------------------------
-plt.figure(figsize=(8, 5))
-plt.hist(epsilon_halo, bins=30, alpha=0.7, color="C0")
-plt.xlabel("Orbital Circularity (ε)")
-plt.ylabel("Number of Stars")
-plt.title("Distribution of Orbital Circularity in Halo Subset")
-plt.show()
-
-# -------------------------------
-# 9. (Optional) Compute and visualize orbital eccentricity for a sample
-# -------------------------------
-n_sample = min(1000, len(halo_stars))
-sample_indices = np.random.choice(
-    np.arange(len(halo_stars)), size=n_sample, replace=False
-)
-
-pos_sample = (
-    np.vstack(
-        (
-            X[halo_mask][sample_indices],
-            Y[halo_mask][sample_indices],
-            Z[halo_mask][sample_indices],
-        )
-    ).T
-    * u.kpc
-)
-vel_sample = np.vstack(
-    (
-        vX[halo_mask][sample_indices],
-        vY[halo_mask][sample_indices],
-        vZ[halo_mask][sample_indices],
+if np.sum(mask_halo) == 0:
+    raise ValueError(
+        "No halo stars remain after applying the circularity cut. Relax threshold for testing."
     )
-).T * (u.km / u.s)
-w0_sample = gd.PhaseSpacePosition(pos=pos_sample, vel=vel_sample)
 
-orbit_sample = mw_pot.integrate_orbit(
-    w0_sample, dt=1 * u.Myr, t1=0 * u.Myr, t2=10 * u.Gyr
-)
+X, Y, Z = X[mask_halo], Y[mask_halo], Z[mask_halo]
+vX, vY, vZ = vX[mask_halo], vY[mask_halo], vZ[mask_halo]
+print("\nAfter halo cut, number of stars:", len(X))
 
-r_peri = np.zeros(n_sample)
-r_apo = np.zeros(n_sample)
-ecc = np.zeros(n_sample)
-for i, orbit in enumerate(orbit_sample):
-    R_orbit = np.sqrt(orbit.pos.x**2 + orbit.pos.y**2).to(u.kpc).value
-    r_peri[i] = np.min(R_orbit)
-    r_apo[i] = np.max(R_orbit)
-    ecc[i] = (r_apo[i] - r_peri[i]) / (r_apo[i] + r_peri[i])
+# Attach units to positions and velocities for the PhaseSpacePosition
+X = np.atleast_1d(X)
+Y = np.atleast_1d(Y)
+Z = np.atleast_1d(Z)
+vX = np.atleast_1d(vX)
+vY = np.atleast_1d(vY)
+vZ = np.atleast_1d(vZ)
 
-plt.figure(figsize=(8, 5))
-plt.hist(ecc, bins=30, alpha=0.7, color="C3")
-plt.xlabel("Eccentricity")
-plt.ylabel("Number of Stars")
-plt.title("Orbital Eccentricity Distribution for a Sample of Halo Stars")
+pos = np.vstack([X, Y, Z]) * u.kpc
+vel = np.vstack([vX, vY, vZ]) * (u.km / u.s)
+w0 = gd.PhaseSpacePosition(pos=pos, vel=vel)
+print("Phase space position shape:", w0.pos.shape)
+if w0.pos.ndim == 1:
+    print("First star's position (with units):", w0.pos)
+else:
+    print("First star's position (with units):", w0.pos[:, 0])
+
+# -------------------------------
+# 6. Integrate orbits using the potential
+# -------------------------------
+H = gp.Hamiltonian(potential)
+orbit = H.integrate_orbit(w0, dt=0.5 * u.Myr, n_steps=2000)
+print("Orbit shape:", orbit.shape)
+print("Sample orbit for first star (first 5 time steps):")
+for t in range(5):
+    print(
+        f"t = {t}: x = {orbit[t, 0].x:.2f}, y = {orbit[t, 0].y:.2f}, z = {orbit[t, 0].z:.2f}"
+    )
+
+# -------------------------------
+# 7. Compute orbital energy and actions using Galpy's Stäckel Fudge
+# -------------------------------
+energies = H.energy(w0)
+energies_kms2 = energies.to(u.km**2 / u.s**2)
+print("\nOrbital energies (km²/s²):")
+for i, E in enumerate(energies_kms2):
+    print(f"Star {i}: E = {E:.2f}")
+
+# Instead of using the O2GF method, we use Galpy's Stäckel Fudge.
+# Import the necessary functions from gala and galpy:
+
+# Convert our potential to a galpy potential:
+galpy_potential = potential.as_interop("galpy")
+
+Nstars = orbit.shape[1]
+J = np.zeros((3, Nstars))
+Omega = np.zeros((3, Nstars))
+for n in range(Nstars):
+    # Convert the integrated orbit for star n to a galpy orbit:
+    o = orbit[:, n].to_galpy_orbit()
+    # Compute the appropriate focal length delta:
+    delta = get_staeckel_fudge_delta(potential, orbit[:, n])
+    # Create the Galpy Stäckel Fudge action-angle object:
+    staeckel = actionAngleStaeckel(pot=galpy_potential, delta=delta)
+    # Compute actions, frequencies, and angles along the orbit:
+    af = staeckel.actionsFreqs(o)
+    # The returned af is a tuple of arrays (actions, angles, freqs); we take the mean over time:
+    af_mean = np.array([np.mean(arr) for arr in af])
+    J[:, n] = af_mean[:3]
+    Omega[:, n] = af_mean[3:]
+
+print("\nActions computed using Galpy's Stäckel Fudge:")
+print("Shape of actions array:", J.shape)
+for n in range(Nstars):
+    print(f"Star {n}: J = {J[:, n]}, Omega = {Omega[:, n]}")
+
+# -------------------------------
+# 8. Plot the integrated orbits (Galactocentric x-y plane)
+# -------------------------------
+fig, ax = plt.subplots(figsize=(8, 8))
+for i in range(orbit.shape[1]):
+    x = orbit[:, i].x.to(u.kpc).value
+    y = orbit[:, i].y.to(u.kpc).value
+    if i < 5:
+        ax.plot(x, y, lw=1.5, alpha=0.8, label=f"Star {i}")
+    else:
+        ax.plot(x, y, lw=1.5, alpha=0.8)
+ax.set_xlabel("x [kpc]")
+ax.set_ylabel("y [kpc]")
+ax.set_title("Integrated Orbits of Selected Halo Stars")
+ax.legend()
+plt.tight_layout()
 plt.show()
